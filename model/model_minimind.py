@@ -3,6 +3,7 @@
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
 from transformers import PretrainedConfig
+from kernel import act_quant, fp8_gemm, fp8_index
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -37,6 +38,12 @@ class MiniMindConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.01,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            use_dsa: bool = False,
+            max_batch_size: int = 32,
+            max_seq_len: int = 340,
+            index_n_heads: int = 64,
+            index_head_dim: int = 128,
+            index_topk: int = 2048,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -76,6 +83,13 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        # DeepSeek Sparse Attention 参数
+        self.use_dsa = False
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.index_n_heads = num_key_value_heads # indexer 头数与 kv 一致，避免与主注意力头维度对不齐
+        self.index_head_dim = 128
+        self.index_topk = 2048
 
 
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
@@ -146,6 +160,81 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
+class LayerNorm(nn.Module):
+    """
+    Layer Normalization.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor):
+        return F.layer_norm(x.float(), (self.dim,), self.weight, self.bias, self.eps).type_as(x)
+
+class Indexer(torch.nn.Module):
+    def __init__(self, args: MiniMindConfig):
+        super().__init__()
+        self.dim: int = args.hidden_size
+        self.n_heads: int = args.index_n_heads   # indexer 注意力头数
+        self.n_local_heads = args.index_n_heads  # indexer 注意力头数
+        self.head_dim: int = args.index_head_dim # indexer 每个注意力头维度
+        self.index_topk: int = args.index_topk   # indexer 选取的 topk
+        self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim) # MQA 的思路，多个 query 共享一个 key，保留多头的同时减少 indexer 中的开销
+        self.wk = nn.Linear(self.dim, self.head_dim)
+        self.q_norm = LayerNorm(self.head_dim)
+        self.k_norm = LayerNorm(self.head_dim)
+        # weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenient.
+        self.weights_proj = nn.Linear(self.dim, self.n_heads, dtype=torch.float32)
+        self.softmax_scale = self.head_dim ** -0.5
+        self.block_size = 128
+        #self.scale_fmt = args.scale_fmt
+
+        self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim, dtype=torch.float8_e4m3fn), persistent=False)
+        self.register_buffer("k_scale_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.head_dim // self.block_size, dtype=torch.float32), persistent=False)
+
+    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
+        assert x.dtype == torch.bfloat16
+        from fast_hadamard_transform import hadamard_transform
+        # TODO(wangjintao): 服务器环境下需要安装fast_hadamard_transform，依赖于nvcc，本地没有显卡就不装了
+        hidden_size = x.size(-1)
+        return hadamard_transform(x, scale=hidden_size ** -0.5)
+
+    def forward(self, x: torch.Tensor, start_pos: int, cos: torch.Tensor, sin: torch.Tensor, mask: Optional[torch.Tensor]):
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        # q k 投影
+        q = self.wq(x)
+        q = self.q_norm(q)
+        q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
+
+        k = self.wk(x)
+        k = self.k_norm(k)
+
+        # 对最后一维旋转，支持多头
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # rotate_activation 让通道分布更均匀、减少相关性和离群值，量化与 top‑k 打分更稳定
+        q = self._rotate_activation(q)
+        k = self._rotate_activation(k)
+        # 量化，减少 indexer 的开销
+        q_fp8, q_scale = act_quant(q, self.block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(k, self.block_size, self.scale_fmt)
+        # cache
+        self.k_cache[:bsz, start_pos:end_pos] = k_fp8
+        self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
+        # indexer 打分
+        weights = self.weights_proj(x.float()) * self.n_heads ** -0.5
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        index_score = fp8_index(q_fp8.contiguous(), weights, self.k_cache[:bsz, :end_pos].contiguous(), self.k_scale_cache[:bsz, :end_pos].contiguous()) # 这里做了隐式 ReLU
+        if mask is not None:
+            index_score += mask
+        topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+        topk_indices_ = topk_indices.clone()
+        assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+        return topk_indices
 
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
@@ -164,6 +253,7 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.indexer = Indexer(args)
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
@@ -179,6 +269,29 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
+        start_pos = past_key_value[0].shape[1] if past_key_value is not None else 0
+        end_pos = start_pos + seq_len
+
+        # 因果 + padding 掩码，形状可广播到 index_score: [B, seq_len, index_heads, end_pos]
+        positions = torch.arange(end_pos, device=x.device)
+        query_pos = torch.arange(seq_len, device=x.device) + start_pos
+        causal_mask = torch.full((seq_len, end_pos), 0.0, device=x.device)
+        causal_mask = causal_mask.masked_fill(positions.unsqueeze(0) > query_pos.unsqueeze(1), float("-inf"))
+        if attention_mask is not None:
+            # 已有的 attention_mask 仅覆盖当前 seq_len，历史部分默认为有效 token
+            full_attn_mask = torch.cat(
+                [
+                    torch.ones(bsz, start_pos, device=attention_mask.device, dtype=attention_mask.dtype),
+                    attention_mask
+                ],
+                dim=1
+            )
+            pad_mask = (1.0 - full_attn_mask.float()).unsqueeze(1).unsqueeze(2) * -1e9
+            indexer_mask = causal_mask.unsqueeze(0).unsqueeze(2) + pad_mask.to(x.device)
+        else:
+            indexer_mask = causal_mask.unsqueeze(0).unsqueeze(2)
+
+        topk_indices = self.indexer(x, start_pos, cos, sin, indexer_mask)
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # kv_cache实现
@@ -193,6 +306,7 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
+        # TODO(wangjintao): 先打分再做矩阵乘法
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
