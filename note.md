@@ -10,9 +10,11 @@
 
 deepseek 开源代码中的 indexer 是 MQA 的形式，多头的 q 对应单头的 k
 
-* prefix 阶段 curlen = n，decode 阶段 curlen = 1
-* `x [bsz, curlen, embed_size]` -> wq_i -> `qi [bsz, curlen, indexer_heads*head_dim]` -> view and transpose -> `qi [bsz, indexer_heads, curlen, head_dim]`
-* `x [bsz, curlen, embed_size]` -> wk_i -> `ki [bsz, curlen, head_dim]` -> unsqueeze -> `ki [bsz, curlen, 1, head_dim]`
+* prefix 阶段 curlen = n
+* `x [bsz, curlen, embed_size]` -> q_proj -> `q [bsz, curlen, indexer_heads*head_dim]` -> view and transpose -> `q [bsz, indexer_heads, curlen, head_dim]`
+* `x [bsz, curlen, embed_size]` -> w_proj -> `k [bsz, curlen, head_dim]` -> view and transpose -> `k [bsz, 1, curlen, head_dim]`
+
+* decode 阶段 curlen = 1
 
 * 点积前的一系列操作，rope，量化等
 * 点积 qi @ ki^T -> `scores [bsz, indexer_heads, curlen, curlen]`

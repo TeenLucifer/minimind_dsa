@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug train_pretrain.py",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/trainer/train_pretrain.py",
+      "cwd": "${workspaceFolder}/trainer",
+      "args": [
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
