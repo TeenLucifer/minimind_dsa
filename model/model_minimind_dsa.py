@@ -337,7 +337,7 @@ class Attention(nn.Module):
             # xq (bsz, n_q_heads, curlen, head_dim)
             # xk (bsz, n_kv_heads, pastlen+curlen, head_dim) -> (bsz, n_q_heads, pastlen+curlen, head_dim)
             # x  (bsz, curlen, embed_dim)
-            topk_indices, index_score = self.indexer(x, start_pos, end_pos, cos, sin, attention_mask, use_cache)
+            topk_indices, index_score = self.indexer(x.detach(), start_pos, end_pos, cos, sin, attention_mask, use_cache)
             mask_shape = (*x.shape[:-1], xk.shape[-2]) # (bsz, curlen, pastlen+culen)
             topk_mask = torch.zeros(
                 mask_shape, dtype=torch.bool, device=x.device
@@ -349,39 +349,39 @@ class Attention(nn.Module):
 
             if self.training:
                 # 算 indexer 的 loss
-
-                attention_weights = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
-                # causal mask
-                causal_mask = torch.triu(
-                    torch.full((seq_len, seq_len), float("-inf"), device=attention_weights.device),
-                    diagonal=1
-                ).unsqueeze(0).unsqueeze(0)  # scores+mask
-                attention_weights = attention_weights + causal_mask
-                index_score = index_score + causal_mask
-                # padding mask
-                if attention_mask is not None:
-                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                    attention_weights = attention_weights + extended_attention_mask
-                    index_score = index_score + extended_attention_mask
-                attention_weights = F.softmax(attention_weights.float(), dim=-1).type_as(xq)
-                if attention_weights.dim() == 4:
-                    attention_weights = attention_weights.sum(1)
                 # topk mask
                 eps = 1e-8
                 topk_mask = topk_mask.squeeze(1)
-                attention_weights = attention_weights.masked_fill(~topk_mask, eps)
-                index_score = index_score.masked_fill(~topk_mask, -1e9)
+                with torch.no_grad():
+                    attention_weights = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
+                    # causal mask
+                    causal_mask = torch.triu(
+                        torch.full((seq_len, seq_len), float("-inf"), device=attention_weights.device),
+                        diagonal=1
+                    ).unsqueeze(0).unsqueeze(0)  # scores+mask
+                    attention_weights = attention_weights + causal_mask
+                    # padding mask
+                    if attention_mask is not None:
+                        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                        extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                        attention_weights = attention_weights + extended_attention_mask
+                    # index 已经过 causal mask 和 padding mask，不再mask
+
+                    attention_weights = F.softmax(attention_weights.float(), dim=-1).type_as(xq)
+                    attention_weights = attention_weights.sum(1)
+
+                    attention_weights = attention_weights.masked_fill(~topk_mask, eps)
+                    attn_dist = attention_weights / attention_weights.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+                index_score = index_score.masked_fill(~topk_mask, float('-inf'))
 
                 index_score = torch.clamp(index_score, min=-1e9, max=1e9)
-                attn_dist = attention_weights / attention_weights.sum(
-                    dim=-1, keepdim=True
-                ).clamp_min(eps)
                 log_index_dist = F.log_softmax(index_score, dim=-1)
 
                 kl_loss = F.kl_div(
                     log_index_dist, attn_dist, reduction="batchmean", log_target=False
                 )
+
                 self.indexer_loss = kl_loss
 
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
@@ -647,12 +647,12 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
-        sparse_loss = 0
+        dsa_loss = 0
         if self.training and self.config.use_dsa:
-            sparse_loss = sum(layer.self_attn.indexer_loss for layer in self.model.layers)
+            dsa_loss = sum(layer.self_attn.indexer_loss for layer in self.model.layers)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
-        output.sparse_loss = sparse_loss
+        output.dsa_loss = dsa_loss
         return output

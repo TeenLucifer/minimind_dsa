@@ -8,9 +8,9 @@
       "program": "${workspaceFolder}/trainer/train_pretrain_dsa.py",
       "cwd": "${workspaceFolder}/trainer",
       "args": [
-        "--batch_size=1",
+        "--batch_size=32",
         "--use_dsa=1",
-        "--dsa_lambda=0.01",
+        "--dsa_lambda=0.0001",
       ],
       "console": "integratedTerminal",
       "justMyCode": false
@@ -22,7 +22,8 @@
       "program": "${workspaceFolder}/eval_llm.py",
       "cwd": "${workspaceFolder}",
       "args": [
-        "--weight=pretrain"
+        "--weight=pretrain",
+        "--use_dsa=1"
       ],
       "console": "integratedTerminal",
       "justMyCode": false

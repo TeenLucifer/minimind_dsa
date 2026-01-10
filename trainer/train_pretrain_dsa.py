@@ -39,7 +39,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             ).view(Y.size())
 
             logits_loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss = logits_loss + res.aux_loss + res.sparse_loss
+            loss = logits_loss + args.dsa_lambda * res.dsa_loss
+            #loss = logits_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -57,11 +58,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_logits_loss = logits_loss.item()
-            current_aux_loss = res.aux_loss.item()
+            current_aux_loss = res.aux_loss.item() if args.use_moe else 0
+            current_dsa_loss = res.dsa_loss.item() if args.use_dsa else 0
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, dsa_loss: {current_dsa_loss:.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
             
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 

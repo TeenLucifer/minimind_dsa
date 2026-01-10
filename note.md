@@ -1,3 +1,5 @@
+下载数据集`modelscope download --dataset gongjy/minimind_dataset --local_dir ./dataset pretrain_hq.jsonl sft_mini_512.jsonl`
+
 * 手动关闭 GQA，保证 q 和 kv 的头数一致
     - 如果想让一组 Q 头共享同一份 topk（类似 GQA 里多 Q 头共享一组 KV），可以把 index_n_heads 配成 num_key_value_heads，然后在注意力里按 n_rep = num_attention_heads // num_key_value_heads 将 topk 结果重复到对应的 Q 头组。
 * 手动关闭 flash，保证走 dsa 分支

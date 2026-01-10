@@ -10,13 +10,16 @@ from trainer.trainer_utils import setup_seed
 warnings.filterwarnings('ignore')
 
 def init_model(args):
+    if args.use_dsa == True:
+        from model.model_minimind_dsa import MiniMindConfig, MiniMindForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
             use_moe=bool(args.use_moe),
-            inference_rope_scaling=args.inference_rope_scaling
+            inference_rope_scaling=args.inference_rope_scaling,
+            use_dsa=bool(args.use_dsa),
         ))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
@@ -44,6 +47,7 @@ def main():
     parser.add_argument('--top_p', default=0.85, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--use_dsa', default=0, type=int, choices=[0, 1], help="是否使用DSA架构（0=否，1=是）")
     args = parser.parse_args()
     
     prompts = [
