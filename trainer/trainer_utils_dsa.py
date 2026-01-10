@@ -104,35 +104,42 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 def init_model(lm_dsa_config, lm_config, freeze_base=True, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    base_model = MiniMindForCausalLM(lm_config)
-    if from_weight!= 'none':
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
-        base_model.load_state_dict(weights, strict=False)
+    if freeze_base == True: # 阶段1：冻结基模参数仅训练indexer
+        base_model = MiniMindForCausalLM(lm_config)
+        if from_weight!= 'none':
+            moe_suffix = '_moe' if lm_config.use_moe else ''
+            weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            weights = torch.load(weight_path, map_location=device)
+            base_model.load_state_dict(weights, strict=False)
 
-    custom_model = MiniMindDSAForCausalLM(lm_dsa_config)
-    custom_model = custom_model.to(base_model.dtype)
-    custom_model.load_state_dict(base_model.state_dict(), strict=False)
+        custom_model = MiniMindDSAForCausalLM(lm_dsa_config)
+        custom_model = custom_model.to(base_model.dtype)
+        custom_model.load_state_dict(base_model.state_dict(), strict=False)
 
-    def assert_close(p1, p2, atol=1e-6):
-        assert torch.allclose(p1.cpu().float(), p2.cpu().float(), atol=atol)
+        def assert_close(p1, p2, atol=1e-6):
+            assert torch.allclose(p1.cpu().float(), p2.cpu().float(), atol=atol)
 
-    assert_close(custom_model.model.embed_tokens.weight,
-                 base_model.model.embed_tokens.weight)
+        assert_close(custom_model.model.embed_tokens.weight,
+                     base_model.model.embed_tokens.weight)
 
-    for i in range(min(2, len(base_model.model.layers))):
-        assert_close(
-            base_model.model.layers[i].self_attn.q_proj.weight,
-            custom_model.model.layers[i].self_attn.q_proj.weight,
-        )
+        for i in range(min(2, len(base_model.model.layers))):
+            assert_close(
+                base_model.model.layers[i].self_attn.q_proj.weight,
+                custom_model.model.layers[i].self_attn.q_proj.weight,
+            )
 
-    del base_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if freeze_base:
+        del base_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         for name, p in custom_model.named_parameters():
             p.requires_grad = ('self_attn.indexer' in name)
+    else: # 阶段2：indexer 与基模联合训练
+        custom_model = MiniMindDSAForCausalLM(lm_dsa_config)
+        if from_weight!= 'none':
+            moe_suffix = '_moe' if lm_config.use_moe else ''
+            weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            weights = torch.load(weight_path, map_location=device)
+            custom_model.load_state_dict(weights, strict=True)
 
     Logger(f'所加载Model可训练参数：{sum(p.numel() for p in custom_model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return custom_model.to(device), tokenizer

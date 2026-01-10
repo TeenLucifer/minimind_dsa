@@ -9,10 +9,10 @@
       "cwd": "${workspaceFolder}/trainer",
       "args": [
         "--batch_size=32",
-        "--save_weight=dsa",
-        "--from_weight=grpo",
+        "--save_weight=dsa_joint",
+        "--from_weight=dsa_warmup",
         "--dsa_lambda=0.0001",
-        "--freeze_base=1",
+        "--freeze_base=0",
       ],
       "console": "integratedTerminal",
       "justMyCode": false
@@ -24,7 +24,7 @@
       "program": "${workspaceFolder}/eval_llm.py",
       "cwd": "${workspaceFolder}",
       "args": [
-        "--weight=dsa",
+        "--weight=dsa_joint",
         "--use_dsa=1"
       ],
       "console": "integratedTerminal",
