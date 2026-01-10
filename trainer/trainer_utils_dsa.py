@@ -10,7 +10,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
-from model.model_minimind_dsa import MiniMindForCausalLM
+from model.model_minimind import MiniMindForCausalLM
+from model.model_minimind_dsa import MiniMindDSAForCausalLM
 
 
 def is_main_process():
@@ -101,18 +102,37 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+def init_model(lm_dsa_config, lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindForCausalLM(lm_config)
-
+    base_model = MiniMindForCausalLM(lm_config)
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
-        model.load_state_dict(weights, strict=False)
+        base_model.load_state_dict(weights, strict=False)
 
-    Logger(f'所加载Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
-    return model.to(device), tokenizer
+    custom_model = MiniMindDSAForCausalLM(lm_dsa_config)
+    custom_model = custom_model.to(base_model.dtype)
+    custom_model.load_state_dict(base_model.state_dict(), strict=False)
+
+    def assert_close(p1, p2, atol=1e-6):
+        assert torch.allclose(p1.cpu().float(), p2.cpu().float(), atol=atol)
+
+    assert_close(custom_model.model.embed_tokens.weight,
+                 base_model.model.embed_tokens.weight)
+
+    for i in range(min(2, len(base_model.model.layers))):
+        assert_close(
+            base_model.model.layers[i].self_attn.q_proj.weight,
+            custom_model.model.layers[i].self_attn.q_proj.weight,
+        )
+
+    del base_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    Logger(f'所加载Model可训练参数：{sum(p.numel() for p in custom_model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+    return custom_model.to(device), tokenizer
 
 
 class SkipBatchSampler(Sampler):

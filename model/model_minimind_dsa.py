@@ -15,7 +15,7 @@ def track_memory(tag=""):
     else:
         print(f"[{tag}] CUDA not available")
 
-class MiniMindConfig(PretrainedConfig):
+class MiniMindDSAConfig(PretrainedConfig):
     model_type = "minimind"
 
     def __init__(
@@ -279,8 +279,8 @@ class Indexer(nn.Module):
         # assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
         return topk_indices, index_score
 
-class Attention(nn.Module):
-    def __init__(self, args: MiniMindConfig):
+class DSAAttention(nn.Module):
+    def __init__(self, args: MiniMindDSAConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
         assert args.num_attention_heads % self.num_key_value_heads == 0
@@ -410,7 +410,7 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindDSAConfig):
         super().__init__()
         if config.intermediate_size is None:
             intermediate_size = int(config.hidden_size * 8 / 3)
@@ -543,13 +543,13 @@ class MOEFeedForward(nn.Module):
         return expert_cache
 
 
-class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+class MiniMindDSABlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindDSAConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.self_attn = Attention(config)
+        self.self_attn = DSAAttention(config)
 
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -567,7 +567,7 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
 
-class MiniMindModel(nn.Module):
+class MiniMindDSAModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -623,13 +623,13 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = MiniMindConfig
+class MiniMindDSAForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindDSAConfig
 
-    def __init__(self, config: MiniMindConfig = None):
-        self.config = config or MiniMindConfig()
+    def __init__(self, config: MiniMindDSAConfig = None):
+        self.config = config or MiniMindDSAConfig()
         super().__init__(self.config)
-        self.model = MiniMindModel(self.config)
+        self.model = MiniMindDSAModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
