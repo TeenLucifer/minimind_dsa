@@ -3,7 +3,17 @@
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
 from transformers import PretrainedConfig
+import torch
 
+def track_memory(tag=""):
+    if torch.cuda.is_available():
+        # 同步一下，确保测量的准确性
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3) # GB
+        max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
+        print(f"[{tag}] Cur: {allocated:.2f}GB | Peak: {max_allocated:.2f}GB")
+    else:
+        print(f"[{tag}] CUDA not available")
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -24,7 +34,7 @@ class MiniMindConfig(PretrainedConfig):
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000.0,
             inference_rope_scaling: bool = False,
-            flash_attn: bool = True,
+            flash_attn: bool = False,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -37,6 +47,12 @@ class MiniMindConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.01,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            max_batch_size: int = 32,
+            max_seq_len: int = 340,
+            # DSA config
+            use_dsa: bool = False,
+            index_n_heads: int = 4,
+            index_topk: int = 32,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -76,6 +92,13 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        # DeepSeek Sparse Attention 参数
+        self.use_dsa = use_dsa
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.index_n_heads = index_n_heads
+        self.index_head_dim = self.hidden_size // self.index_n_heads
+        self.index_topk = index_topk
 
 
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
@@ -146,6 +169,115 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
+class LayerNorm(nn.Module):
+    """
+    Layer Normalization.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor):
+        return F.layer_norm(x.float(), (self.dim,), self.weight, self.bias, self.eps).type_as(x)
+
+class Indexer(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.d_model = config.hidden_size
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads # 为了复用主注意力的旋转编码，indexer 每个注意力头的维度与主注意力维度一致
+        self.index_topk = config.index_topk
+
+        self.q_proj = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.head_dim, bias=False)
+        self.w_proj = nn.Linear(self.d_model, self.n_heads, bias=False)
+        self.q_norm = LayerNorm(self.head_dim)
+        self.k_norm = LayerNorm(self.head_dim)
+
+        self.softmax_scale = self.head_dim**-0.5
+        self.k_cache = None
+        self.max_seq_len = config.max_position_embeddings
+
+    def _fp16_index(self, q, weights, k):
+        # q: (bsz, seqlen, n_heads, head_dim)
+        # weights: (bsz, seq_len, n_heads, 1)
+        # k: (bsz, seqlen_k, head_dim)
+        index_score = torch.einsum(
+            "bsnd,btd->bsnt", q, k
+        )  # (bsz, seqlen, n_heads, seqlen_k)
+        index_score = F.relu(index_score)
+        weighted = index_score * weights  # (bsz, seqlen, n_heads, seqlen_k)
+        index_score = weighted.sum(dim=2)  # (bsz, seqlen, seqlen_k)
+        return index_score
+
+    def _update(self, k, start_pos, end_pos):
+        bsz, seqlen, _ = k.shape
+        assert seqlen == end_pos - start_pos, "k length must match [start_pos, end_pos)"
+        if self.k_cache is None:
+            self.k_cache = torch.zeros(
+                bsz, self.max_seq_len, self.head_dim, dtype=k.dtype, device=k.device
+            )
+        self.k_cache[:, start_pos:end_pos] = k
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        end_pos: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: Optional[torch.Tensor]=None,
+        use_cache: bool=False
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+        hidden_shape = (bsz, seqlen, -1, self.head_dim)
+        q = self.q_norm(self.q_proj(x).view(hidden_shape))#.transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(hidden_shape))#.transpose(1, 2)
+        # q (bsz, seqlen, n_heads, head_dim)
+        # k (bsz, seqlen, 1,       head_dim)
+
+        q, k = apply_rotary_pos_emb(q, k, cos[:seqlen], sin[:seqlen])  # (bsz, n_heads, seqlen, head_dim)
+        k = k.squeeze(2)
+        # q (bsz, seqlen, n_heads, head_dim)
+        # k (bsz, seqlen, head_dim)
+
+        if use_cache and start_pos >= 0 and end_pos >= 0:
+            self._update(k, start_pos, end_pos)
+            k = self.k_cache[:, :end_pos] # k (bsz, pastlen+seqlen, head_dim) (bsz, seqlen_k, head_dim)
+
+        weights = self.w_proj(x) * self.n_heads**-0.5  # (bsz, seqlen, n_heads)
+        weights = (
+            weights.unsqueeze(-1) * self.softmax_scale
+        )  # (bsz, seqlen, n_heads, 1)
+        # TODO(wangjintao): 这一步本质不了解
+        # 形式上就是一个QK^T，出来一个张量 (bsz, seqlen, seqlen_k)
+        # 里面的 einsum 是什么原理不懂
+        index_score = self._fp16_index(q, weights, k)  # (bsz, seqlen, seqlen_k)
+        # padding 掩码
+        if attention_mask is not None:
+            index_score = index_score.masked_fill(
+                attention_mask[:, None, :] == 0,
+                float("-inf")
+            )
+
+        # 因果掩码
+        seqlen_k = index_score.shape[-1]
+        mask = (
+            torch.full((seqlen, seqlen_k), float("-inf"), device=x.device).triu_(1)
+            if seqlen > 1
+            else None
+        )
+        if mask is not None:
+            index_score += mask
+
+        topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+        # topk_indices_ = topk_indices.clone()
+        # dist.broadcast(topk_indices_, src=0)
+        # assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
+        return topk_indices, index_score
 
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
@@ -164,6 +296,9 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.use_dsa = args.use_dsa
+        self.indexer = Indexer(args)
+        self.indexer_loss = 0
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
@@ -179,6 +314,9 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
+        start_pos = past_key_value[0].shape[1] if past_key_value is not None else 0
+        end_pos = start_pos + seq_len
+
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # kv_cache实现
@@ -193,14 +331,69 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
+        self.indexer_loss = 0
+        if self.use_dsa:
+            # topk_indices (bsz, curlen, pastlen+curlen) if (topk > pastlen+curlen) else (bsz, curlen, topk)
+            # xq (bsz, n_q_heads, curlen, head_dim)
+            # xk (bsz, n_kv_heads, pastlen+curlen, head_dim) -> (bsz, n_q_heads, pastlen+curlen, head_dim)
+            # x  (bsz, curlen, embed_dim)
+            topk_indices, index_score = self.indexer(x, start_pos, end_pos, cos, sin, attention_mask, use_cache)
+            mask_shape = (*x.shape[:-1], xk.shape[-2]) # (bsz, curlen, pastlen+culen)
+            topk_mask = torch.zeros(
+                mask_shape, dtype=torch.bool, device=x.device
+            ) # (bsz, curlen, pastlen+culen)
+            topk_mask = topk_mask.scatter_(-1, topk_indices, True)
+            topk_mask = topk_mask.unsqueeze(1) # (bsz, 1, curlen, pastlen+curlen)
+            index_mask = torch.zeros_like(topk_mask, dtype=xq.dtype)
+            index_mask = index_mask.masked_fill(~topk_mask, float("-inf"))
+
+            if self.training:
+                # 算 indexer 的 loss
+
+                attention_weights = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
+                # causal mask
+                causal_mask = torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=attention_weights.device),
+                    diagonal=1
+                ).unsqueeze(0).unsqueeze(0)  # scores+mask
+                attention_weights = attention_weights + causal_mask
+                index_score = index_score + causal_mask
+                # padding mask
+                if attention_mask is not None:
+                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                    attention_weights = attention_weights + extended_attention_mask
+                    index_score = index_score + extended_attention_mask
+                attention_weights = F.softmax(attention_weights.float(), dim=-1).type_as(xq)
+                if attention_weights.dim() == 4:
+                    attention_weights = attention_weights.sum(1)
+                # topk mask
+                eps = 1e-8
+                topk_mask = topk_mask.squeeze(1)
+                attention_weights = attention_weights.masked_fill(~topk_mask, eps)
+                index_score = index_score.masked_fill(~topk_mask, -1e9)
+
+                index_score = torch.clamp(index_score, min=-1e9, max=1e9)
+                attn_dist = attention_weights / attention_weights.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(eps)
+                log_index_dist = F.log_softmax(index_score, dim=-1)
+
+                kl_loss = F.kl_div(
+                    log_index_dist, attn_dist, reduction="batchmean", log_target=False
+                )
+                self.indexer_loss = kl_loss
+
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=index_mask if self.use_dsa else None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
             scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
+            if self.use_dsa:
+                scores = scores + index_mask
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -284,7 +477,7 @@ class MoEGate(nn.Module):
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
-            aux_loss = scores.new_zeros(1).squeeze()
+            aux_loss = 0
         return topk_idx, topk_weight, aux_loss
 
 
@@ -315,9 +508,7 @@ class MOEFeedForward(nn.Module):
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             y = torch.empty_like(x, dtype=x.dtype)
             for i, expert in enumerate(self.experts):
-                expert_out = expert(x[flat_topk_idx == i])
-                if expert_out.shape[0] > 0: y[flat_topk_idx == i] = expert_out.to(y.dtype)
-                else: y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
@@ -423,7 +614,12 @@ class MiniMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MOEFeedForward)
+        )
+
         return hidden_states, presents, aux_loss
 
 
@@ -451,8 +647,12 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
+        sparse_loss = 0
+        if self.training and self.config.use_dsa:
+            sparse_loss = sum(layer.self_attn.indexer_loss for layer in self.model.layers)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
+        output.sparse_loss = sparse_loss
         return output
