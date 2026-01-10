@@ -88,7 +88,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
-    parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
+    parser.add_argument('--save_weight', default='dsa', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
@@ -108,8 +108,9 @@ if __name__ == "__main__":
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
-    parser.add_argument('--use_dsa', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--dsa_lambda", type=float, default=0.01, help="dsa loss 率")
+    parser.add_argument('--use_dsa', default=1, type=int, choices=[0, 1], help="是否使用DSA架构（0=否，1=是）")
+    parser.add_argument("--dsa_lambda", default=0.01, type=float, help="dsa loss 率")
+    parser.add_argument("--freeze_base", default=1, type=int, choices=[0, 1], help="是否冻结基模（0=否，1=是）")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -138,7 +139,7 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_dsa_config, lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_dsa_config, lm_config, bool(args.freeze_base), args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))

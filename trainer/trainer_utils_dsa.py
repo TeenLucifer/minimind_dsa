@@ -102,7 +102,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_dsa_config, lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+def init_model(lm_dsa_config, lm_config, freeze_base=True, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     base_model = MiniMindForCausalLM(lm_config)
     if from_weight!= 'none':
@@ -130,6 +130,9 @@ def init_model(lm_dsa_config, lm_config, from_weight='pretrain', tokenizer_path=
     del base_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if freeze_base:
+        for name, p in custom_model.named_parameters():
+            p.requires_grad = ('self_attn.indexer' in name)
 
     Logger(f'所加载Model可训练参数：{sum(p.numel() for p in custom_model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return custom_model.to(device), tokenizer

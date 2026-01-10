@@ -2,15 +2,17 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug train_pretrain_dsa.py",
+      "name": "Debug train_dsa.py",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/trainer/train_pretrain_dsa.py",
+      "program": "${workspaceFolder}/trainer/train_dsa.py",
       "cwd": "${workspaceFolder}/trainer",
       "args": [
         "--batch_size=32",
-        "--use_dsa=1",
+        "--save_weight=dsa",
+        "--from_weight=grpo",
         "--dsa_lambda=0.0001",
+        "--freeze_base=1",
       ],
       "console": "integratedTerminal",
       "justMyCode": false
@@ -22,7 +24,7 @@
       "program": "${workspaceFolder}/eval_llm.py",
       "cwd": "${workspaceFolder}",
       "args": [
-        "--weight=pretrain",
+        "--weight=dsa",
         "--use_dsa=1"
       ],
       "console": "integratedTerminal",

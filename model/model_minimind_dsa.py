@@ -184,7 +184,7 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x.float(), (self.dim,), self.weight, self.bias, self.eps).type_as(x)
 
 class Indexer(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindDSAConfig):
         super().__init__()
         self.d_model = config.hidden_size
         self.n_heads = config.index_n_heads
@@ -426,7 +426,7 @@ class FeedForward(nn.Module):
 
 
 class MoEGate(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindDSAConfig):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_tok
@@ -482,7 +482,7 @@ class MoEGate(nn.Module):
 
 
 class MOEFeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindDSAConfig):
         super().__init__()
         self.config = config
         self.experts = nn.ModuleList([
@@ -568,13 +568,13 @@ class MiniMindDSABlock(nn.Module):
 
 
 class MiniMindDSAModel(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindDSAConfig):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.layers = nn.ModuleList([MiniMindDSABlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,

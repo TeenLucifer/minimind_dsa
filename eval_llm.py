@@ -5,22 +5,29 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_minimind_dsa import MiniMindDSAConfig, MiniMindDSAForCausalLM
 from model.model_lora import *
 from trainer.trainer_utils import setup_seed
 warnings.filterwarnings('ignore')
 
 def init_model(args):
-    if args.use_dsa == True:
-        from model.model_minimind_dsa import MiniMindConfig, MiniMindForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
-        model = MiniMindForCausalLM(MiniMindConfig(
-            hidden_size=args.hidden_size,
-            num_hidden_layers=args.num_hidden_layers,
-            use_moe=bool(args.use_moe),
-            inference_rope_scaling=args.inference_rope_scaling,
-            use_dsa=bool(args.use_dsa),
-        ))
+        if args.use_dsa == True:
+            model = MiniMindDSAForCausalLM(MiniMindDSAConfig(
+                hidden_size=args.hidden_size,
+                num_hidden_layers=args.num_hidden_layers,
+                use_moe=bool(args.use_moe),
+                inference_rope_scaling=args.inference_rope_scaling,
+                use_dsa=bool(args.use_dsa),
+            ))
+        else:
+            model = MiniMindForCausalLM(MiniMindConfig(
+                hidden_size=args.hidden_size,
+                num_hidden_layers=args.num_hidden_layers,
+                use_moe=bool(args.use_moe),
+                inference_rope_scaling=args.inference_rope_scaling,
+            ))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
