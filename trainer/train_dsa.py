@@ -109,6 +109,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument('--use_dsa', default=1, type=int, choices=[0, 1], help="是否使用DSA架构（0=否，1=是）")
+    parser.add_argument('--use_mask', default=0, type=int, choices=[0, 1], help="是否使用mask方式（0=否，1=是）")
     parser.add_argument("--dsa_lambda", default=0.01, type=float, help="dsa loss 率")
     parser.add_argument("--freeze_base", default=1, type=int, choices=[0, 1], help="是否冻结基模（0=否，1=是）")
     args = parser.parse_args()
