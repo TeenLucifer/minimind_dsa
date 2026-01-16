@@ -52,6 +52,7 @@ class MiniMindDSAConfig(PretrainedConfig):
             # DSA config
             use_dsa: bool = False,
             use_mask: bool = False,
+            freeze_base: bool = False,
             index_n_heads: int = 4,
             index_topk: int = 32,
             **kwargs
@@ -96,6 +97,7 @@ class MiniMindDSAConfig(PretrainedConfig):
         # DeepSeek Sparse Attention 参数
         self.use_dsa = use_dsa
         self.use_mask = use_mask
+        self.freeze_base = freeze_base
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.index_n_heads = index_n_heads
@@ -299,6 +301,7 @@ class DSAAttention(nn.Module):
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         self.use_dsa = args.use_dsa
+        self.freeze_base = args.freeze_base
         self.use_mask = args.use_mask
         self.indexer = Indexer(args)
         self.indexer_loss = 0
@@ -390,35 +393,40 @@ class DSAAttention(nn.Module):
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=index_mask if self.use_dsa else None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
-            if self.use_dsa == True and self.use_mask == True:
-                scores = scores + index_mask
+            if self.use_dsa == True and self.freeze_base == False:
+                if self.use_mask == True:
+                    scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
+                    #scores = scores + torch.triu(
+                    #    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                    #    diagonal=1
+                    #).unsqueeze(0).unsqueeze(0)  # scores+mask
+                    scores = scores + index_mask
+                else:
+                    T = xq.shape[2]
+                    B, H, S, D = xk.shape
+                    K = topk_indices.shape[2]
+                    L = T * K
+                    topk_flat = topk_indices.reshape(B, L)
+                    idx = topk_flat[:, None, :, None].expand(B, H, L, D)
+                    xk_topk = torch.gather(xk, dim=2, index=idx).reshape(B, H, T, K, D)
+                    xv_topk = torch.gather(xv, dim=2, index=idx).reshape(B, H, T, K, D)
+                    scores = torch.einsum('bhtd,bhtkd->bhtk', xq, xk_topk) / math.sqrt(D) # (bsz, n_q_heads, curlen, topk)
+            else:
+                scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
+                scores = scores + torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                    diagonal=1
+                ).unsqueeze(0).unsqueeze(0)  # scores+mask
 
-            if self.use_dsa == True and self.use_mask == False:
-                T = xq.shape[2]
-                B, H, S, D = xk.shape
-                K = topk_indices.shape[2]
-                L = T * K
-                topk_flat = topk_indices.reahpe(L)
-                idx = topk_flat[:, None].expand(L, D)
-                xk_topk = torch.gather(xk, dim=0, index=idx).reshape(B, H, T, K, D)
-                xv_topk = torch.gather(xv, dim=0, index=idx).reshape(B, H, T, K, D)
-                scores = torch.einsum('bhtd,bhtkd->bhtk', xq, xk_topk) / math.sqrt(D) # (bsz, n_q_heads, curlen, topk)
-
-            scores = scores + torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                diagonal=1
-            ).unsqueeze(0).unsqueeze(0)  # scores+mask
-
-            if attention_mask is not None:
-                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                scores = scores + extended_attention_mask
+                if attention_mask is not None:
+                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                    scores = scores + extended_attention_mask
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            if self.use_dsa and self.use_mask:
-                output = torch.einsum('bhtd,bhtkd->bhtk', xq, xv_topk) # (bsz, n_q_heads, curlen, topk)
+            if self.use_dsa == True and self.use_mask == False and self.freeze_base == False:
+                output = torch.einsum('bhtk,bhtkd->bhtd', scores, xv_topk) # (bsz, n_q_heads, curlen, topk)
             else:
                 output = scores @ xv
 

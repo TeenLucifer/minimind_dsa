@@ -20,6 +20,7 @@ def init_model(args):
                 use_moe=bool(args.use_moe),
                 inference_rope_scaling=args.inference_rope_scaling,
                 use_dsa=bool(args.use_dsa),
+                freeze_base=bool(args.freeze_base),
             ))
         else:
             model = MiniMindForCausalLM(MiniMindConfig(
@@ -55,6 +56,7 @@ def main():
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     parser.add_argument('--use_dsa', default=0, type=int, choices=[0, 1], help="是否使用DSA架构（0=否，1=是）")
+    parser.add_argument('--freeze_base', default=0, type=int, choices=[0, 1], help="是否冻结基模参数（0=否，1=是）")
     args = parser.parse_args()
     
     prompts = [

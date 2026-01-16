@@ -9,10 +9,10 @@
       "cwd": "${workspaceFolder}/trainer",
       "args": [
         "--batch_size=32",
-        "--save_weight=dsa_warmup",
-        "--from_weight=dsa_sft",
+        "--save_weight=dsa_joint",
+        "--from_weight=dsa_warmup",
         "--dsa_lambda=0.0001",
-        "--freeze_base=1",
+        "--freeze_base=0",
         "--use_mask=0"
       ],
       "console": "integratedTerminal",
@@ -26,7 +26,8 @@
       "cwd": "${workspaceFolder}",
       "args": [
         "--weight=dsa_joint",
-        "--use_dsa=1"
+        "--use_dsa=1",
+        "--freeze_base=0",
       ],
       "console": "integratedTerminal",
       "justMyCode": false
