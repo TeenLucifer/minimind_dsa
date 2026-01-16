@@ -13,7 +13,7 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.model_minimind_dsa import MiniMindDSAConfig
+from model.model_minimind_dsa import MiniMindDSAConfig, DSAStage
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils_dsa import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
@@ -109,9 +109,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument('--use_dsa', default=1, type=int, choices=[0, 1], help="是否使用DSA架构（0=否，1=是）")
-    parser.add_argument('--use_mask', default=0, type=int, choices=[0, 1], help="是否使用mask方式（0=否，1=是）")
-    parser.add_argument("--dsa_lambda", default=0.01, type=float, help="dsa loss 率")
-    parser.add_argument("--freeze_base", default=1, type=int, choices=[0, 1], help="是否冻结基模（0=否，1=是）")
+    parser.add_argument('--dsa_stage', default="warmup", type=str, choices=["warmup", "joint"], help="DSA训练阶段（warmup仅训练indexer，joint联合基模训练）")
+    parser.add_argument("--dsa_lambda", default=0.0001, type=float, help="dsa loss 率")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -121,7 +120,7 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_dsa_config = MiniMindDSAConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe), use_dsa=bool(args.use_dsa), freeze_base=bool(args.freeze_base))
+    lm_dsa_config = MiniMindDSAConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe), use_dsa=bool(args.use_dsa), dsa_stage=DSAStage(args.dsa_stage))
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     

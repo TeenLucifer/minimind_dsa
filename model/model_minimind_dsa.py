@@ -4,16 +4,11 @@
 
 from transformers import PretrainedConfig
 import torch
+from enum import Enum
 
-def track_memory(tag=""):
-    if torch.cuda.is_available():
-        # 同步一下，确保测量的准确性
-        torch.cuda.synchronize()
-        allocated = torch.cuda.memory_allocated() / (1024 ** 3) # GB
-        max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
-        print(f"[{tag}] Cur: {allocated:.2f}GB | Peak: {max_allocated:.2f}GB")
-    else:
-        print(f"[{tag}] CUDA not available")
+class DSAStage(str, Enum):
+    WARMUP = "warmup" # 一阶段 warmup 仅训练 indexer
+    JOINT = "joint"   # 二阶段 indexer 和基模联合训练
 
 class MiniMindDSAConfig(PretrainedConfig):
     model_type = "minimind"
@@ -51,8 +46,7 @@ class MiniMindDSAConfig(PretrainedConfig):
             max_seq_len: int = 340,
             # DSA config
             use_dsa: bool = False,
-            use_mask: bool = False,
-            freeze_base: bool = False,
+            dsa_stage: DSAStage = DSAStage.WARMUP,
             index_n_heads: int = 4,
             index_topk: int = 32,
             **kwargs
@@ -96,8 +90,7 @@ class MiniMindDSAConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
         # DeepSeek Sparse Attention 参数
         self.use_dsa = use_dsa
-        self.use_mask = use_mask
-        self.freeze_base = freeze_base
+        self.dsa_stage = dsa_stage
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.index_n_heads = index_n_heads
@@ -173,6 +166,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
+
 class LayerNorm(nn.Module):
     """
     Layer Normalization.
@@ -186,6 +180,7 @@ class LayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return F.layer_norm(x.float(), (self.dim,), self.weight, self.bias, self.eps).type_as(x)
+
 
 class Indexer(nn.Module):
     def __init__(self, config: MiniMindDSAConfig):
@@ -256,9 +251,7 @@ class Indexer(nn.Module):
         weights = (
             weights.unsqueeze(-1) * self.softmax_scale
         )  # (bsz, seqlen, n_heads, 1)
-        # TODO(wangjintao): 这一步本质不了解
-        # 形式上就是一个QK^T，出来一个张量 (bsz, seqlen, seqlen_k)
-        # 里面的 einsum 是什么原理不懂
+
         index_score = self._fp16_index(q, weights, k)  # (bsz, seqlen, seqlen_k)
         # padding 掩码
         if attention_mask is not None:
@@ -283,6 +276,7 @@ class Indexer(nn.Module):
         # assert torch.all(topk_indices == topk_indices_), f"{topk_indices=} {topk_indices_=}"
         return topk_indices, index_score
 
+
 class DSAAttention(nn.Module):
     def __init__(self, args: MiniMindDSAConfig):
         super().__init__()
@@ -301,8 +295,7 @@ class DSAAttention(nn.Module):
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         self.use_dsa = args.use_dsa
-        self.freeze_base = args.freeze_base
-        self.use_mask = args.use_mask
+        self.dsa_stage = args.dsa_stage
         self.indexer = Indexer(args)
         self.indexer_loss = 0
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -348,17 +341,15 @@ class DSAAttention(nn.Module):
             topk_mask = torch.zeros(
                 mask_shape, dtype=torch.bool, device=x.device
             ) # (bsz, curlen, pastlen+culen)
-            topk_mask = topk_mask.scatter_(-1, topk_indices, True)
+            topk_mask = topk_mask.scatter_(-1, topk_indices, True) # 给有效的 topk 打上 True
             topk_mask = topk_mask.unsqueeze(1) # (bsz, 1, curlen, pastlen+curlen)
-            index_mask = torch.zeros_like(topk_mask, dtype=xq.dtype)
-            index_mask = index_mask.masked_fill(~topk_mask, float("-inf"))
 
             if self.training:
                 # 算 indexer 的 loss
                 # topk mask
                 eps = 1e-8
                 topk_mask = topk_mask.squeeze(1)
-                with torch.no_grad():
+                with torch.no_grad(): # 主注意力不参与梯度反向传播
                     attention_weights = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
                     # causal mask
                     causal_mask = torch.triu(
@@ -376,10 +367,11 @@ class DSAAttention(nn.Module):
                     attention_weights = F.softmax(attention_weights.float(), dim=-1).type_as(xq)
                     attention_weights = attention_weights.sum(1)
 
-                    attention_weights = attention_weights.masked_fill(~topk_mask, eps)
+                    # TODO(wangjintao): 需要打 mask 吗，主要目的是为了让 indexer 注意力分布逼近主主干注意力分布
+                    #attention_weights = attention_weights.masked_fill(~topk_mask, eps) # 无效的 token 打上极小值
                     attn_dist = attention_weights / attention_weights.sum(dim=-1, keepdim=True).clamp_min(eps)
 
-                index_score = index_score.masked_fill(~topk_mask, float('-inf'))
+                #index_score = index_score.masked_fill(~topk_mask, float('-inf')) # 无效的 token 打上极小值
 
                 index_score = torch.clamp(index_score, min=-1e9, max=1e9)
                 log_index_dist = F.log_softmax(index_score, dim=-1)
@@ -390,27 +382,19 @@ class DSAAttention(nn.Module):
 
                 self.indexer_loss = kl_loss
 
-        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=index_mask if self.use_dsa else None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        if (not self.use_dsa) and self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
-            if self.use_dsa == True and self.freeze_base == False:
-                if self.use_mask == True:
-                    scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
-                    #scores = scores + torch.triu(
-                    #    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                    #    diagonal=1
-                    #).unsqueeze(0).unsqueeze(0)  # scores+mask
-                    scores = scores + index_mask
-                else:
-                    T = xq.shape[2]
-                    B, H, S, D = xk.shape
-                    K = topk_indices.shape[2]
-                    L = T * K
-                    topk_flat = topk_indices.reshape(B, L)
-                    idx = topk_flat[:, None, :, None].expand(B, H, L, D)
-                    xk_topk = torch.gather(xk, dim=2, index=idx).reshape(B, H, T, K, D)
-                    xv_topk = torch.gather(xv, dim=2, index=idx).reshape(B, H, T, K, D)
-                    scores = torch.einsum('bhtd,bhtkd->bhtk', xq, xk_topk) / math.sqrt(D) # (bsz, n_q_heads, curlen, topk)
+            if self.use_dsa and (not (self.training and self.dsa_stage == DSAStage.WARMUP)): # dsa warmup 训练时不用稀疏注意力
+                T = xq.shape[2]
+                B, H, S, D = xk.shape
+                K = topk_indices.shape[2]
+                L = T * K
+                topk_flat = topk_indices.reshape(B, L)
+                idx = topk_flat[:, None, :, None].expand(B, H, L, D)
+                xk_topk = torch.gather(xk, dim=2, index=idx).reshape(B, H, T, K, D)
+                xv_topk = torch.gather(xv, dim=2, index=idx).reshape(B, H, T, K, D)
+                scores = torch.einsum('bhtd,bhtkd->bhtk', xq, xk_topk) / math.sqrt(D) # (bsz, n_q_heads, curlen, topk)
             else:
                 scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # (bsz, n_q_heads, curlen, pastlen+curlen)
                 scores = scores + torch.triu(
@@ -425,7 +409,8 @@ class DSAAttention(nn.Module):
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            if self.use_dsa == True and self.use_mask == False and self.freeze_base == False:
+
+            if self.use_dsa and (not (self.training and self.dsa_stage == DSAStage.WARMUP)): # dsa warmup 训练时不用稀疏注意力
                 output = torch.einsum('bhtk,bhtkd->bhtd', scores, xv_topk) # (bsz, n_q_heads, curlen, topk)
             else:
                 output = scores @ xv
